@@ -27,7 +27,7 @@ Windows 10/11 · 单文件 · 免安装 · 不修改 QQ
 
 ## 下载与安装
 
-1. 到本仓库的 **Releases** 页面下载最新的 `QQViewerPin-v1.zip`；
+1. 到本仓库的 **Releases** 页面下载最新的 `QQViewerPin-v1.0.0.zip`；
 2. 复制到桌面或 `C:\Tools` 等普通文件夹，**解压后**运行 `QQViewerPin.exe`；
 3. 首次启动会创建 `%APPDATA%\QQViewerPin\config.json`。
 
@@ -123,7 +123,7 @@ QQViewerPin/
 └─ .gitignore
 ```
 
-`dist/`、`testdata/`、生成的 exe 和日志只用于本地打包/测试，不提交到仓库；发布时把 `dist/QQViewerPin-v1.zip` 上传到 GitHub Releases。
+`dist/`、`testdata/`、生成的 exe 和日志只用于本地打包/测试，不提交到仓库；发布时把 `dist/QQViewerPin-v1.0.0.zip` 上传到 GitHub Releases。
 
 ## 贡献
 
