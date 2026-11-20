@@ -56,12 +56,23 @@ namespace QQViewerPin
         private readonly Timer _guardTimer;
         private readonly Timer _maintenanceTimer;
         private readonly Timer _retryTimer;
+        private readonly Timer _cloakTimer;
+        private readonly Timer _fastTimer;
         private int _guardTicks;
+        private IntPtr _fastHwnd = IntPtr.Zero;
+        private int _fastPercent = 50;
+        private DateTime _fastUntil = DateTime.MinValue;
         private readonly List<IntPtr> _pending = new List<IntPtr>();
+        private readonly Dictionary<IntPtr, DateTime> _cloaked = new Dictionary<IntPtr, DateTime>();
+        private readonly Dictionary<IntPtr, int> _candidateOriginalEx = new Dictionary<IntPtr, int>();
+        private readonly HashSet<IntPtr> _dwmCloaked = new HashSet<IntPtr>();
+        private readonly HashSet<IntPtr> _hiddenCandidates = new HashSet<IntPtr>();
+        private bool _revealing;
 
         private readonly Dictionary<uint, PreviewApp> _procCache = new Dictionary<uint, PreviewApp>();
         private bool _paused;
         private bool _started;
+        private bool _adopting;
 
         public event EventHandler<AlphaChangedEventArgs> AlphaChanged;
 
@@ -85,6 +96,14 @@ namespace QQViewerPin
             _retryTimer = new Timer();
             _retryTimer.Interval = 150;
             _retryTimer.Tick += RetryTimerTick;
+
+            _cloakTimer = new Timer();
+            _cloakTimer.Interval = 500;
+            _cloakTimer.Tick += CloakTimerTick;
+
+            _fastTimer = new Timer();
+            _fastTimer.Interval = 10;
+            _fastTimer.Tick += FastTimerTick;
         }
 
         public PreviewApp App
@@ -112,6 +131,8 @@ namespace QQViewerPin
                 {
                     _guardTimer.Stop();
                     _pending.Clear();
+                    StopFast();
+                    UncloakAll();
                 }
             }
         }
@@ -155,6 +176,7 @@ namespace QQViewerPin
             }
 
             _maintenanceTimer.Start();
+            _cloakTimer.Start();
             ConfigStore.Log(AppName + "：已启动。");
         }
 
@@ -178,6 +200,9 @@ namespace QQViewerPin
             _guardTimer.Stop();
             _maintenanceTimer.Stop();
             _retryTimer.Stop();
+            _cloakTimer.Stop();
+            StopFast();
+            UncloakAll();
 
             RestoreActiveStyle();
             ConfigStore.Save(_cfg);
@@ -298,7 +323,12 @@ namespace QQViewerPin
             {
                 HandleShow(hwnd);
             }
-            else if (eventType == Native.EVENT_OBJECT_HIDE || eventType == Native.EVENT_OBJECT_DESTROY)
+            else if (eventType == Native.EVENT_OBJECT_HIDE)
+            {
+                if (_hiddenCandidates.Contains(hwnd)) return;
+                HandleGone(hwnd);
+            }
+            else if (eventType == Native.EVENT_OBJECT_DESTROY)
             {
                 HandleGone(hwnd);
             }
@@ -316,6 +346,13 @@ namespace QQViewerPin
         private void HandleNameChange(IntPtr hwnd)
         {
             PreparePreview(hwnd, "标题就绪时");
+
+            PreviewType type;
+            if (LooksLikePreview(hwnd, false, out type))
+            {
+                ApplyAlphaInternal(hwnd, GetAlpha());
+                Adopt(hwnd, type);
+            }
         }
 
         private void PreparePreview(IntPtr hwnd, string stage)
@@ -346,7 +383,7 @@ namespace QQViewerPin
 
         private void HandleShow(IntPtr hwnd)
         {
-            if (_paused || !Enabled) return;
+            if (_paused || !Enabled || _revealing) return;
             if (hwnd == _active) return;
 
             PreviewType type;
@@ -357,13 +394,18 @@ namespace QQViewerPin
             }
 
             ApplyAlphaInternal(hwnd, GetAlpha());
-            Adopt(hwnd, type);
-        }
+            Adopt(hwnd, type);        }
 
         private void HandleGone(IntPtr hwnd)
         {
-            if (hwnd != _active) return;
+            if (hwnd != _active)
+            {
+                Uncloak(hwnd);
+                return;
+            }
 
+            Uncloak(hwnd);
+            if (_fastHwnd == hwnd) StopFast();
             RectI now = Native.GetRect(_active);
             if (now != null && now.W > 0 && now.H > 0)
             {
@@ -470,15 +512,34 @@ namespace QQViewerPin
 
         private void Adopt(IntPtr hwnd, PreviewType type)
         {
-            if (_paused || !Enabled) return;
+            if (_paused || !Enabled || _adopting) return;
             if (hwnd == IntPtr.Zero) return;
 
             RectI cur = Native.GetRect(hwnd);
             if (cur == null || cur.W < 50 || cur.H < 50) return;
 
+            _adopting = true;
+            try
+            {
+                AdoptCore(hwnd, type, cur);
+            }
+            finally
+            {
+                _adopting = false;
+            }
+        }
+
+        private void AdoptCore(IntPtr hwnd, PreviewType type, RectI cur)
+        {
             CaptureActiveRect();
 
             int ex = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
+            int originalEx = ex;
+            int candidateEx;
+            if (_candidateOriginalEx.TryGetValue(hwnd, out candidateEx))
+            {
+                originalEx = candidateEx;
+            }
 
             RectData saved = GetSavedRect(type);
             RectI target;
@@ -499,7 +560,7 @@ namespace QQViewerPin
 
             _active = hwnd;
             _activeType = type;
-            _originalEx = ex;
+            _originalEx = originalEx;
             _haveOriginalEx = true;
             _target = target;
             _lastRect = target.Clone();
@@ -508,6 +569,8 @@ namespace QQViewerPin
             ConfigStore.Log(AppName + "：接管预览窗 hwnd=0x" + hwnd.ToInt64().ToString("X") +
                 " 类型=" + type + " 目标=" + target.X + "," + target.Y + " " +
                 target.W + "x" + target.H + " alpha=" + GetAlpha());
+            ForgetCandidate(hwnd);
+            StartFast(hwnd, GetAlpha(), 1000);
             CloseOtherPreviews(hwnd);
             StartGuard();
         }
@@ -584,6 +647,236 @@ namespace QQViewerPin
             if (y + h > info.rcWork.Bottom) y = info.rcWork.Bottom - h;
 
             return new RectI(x, y, w, h);
+        }
+
+        private void CloakCandidate(IntPtr hwnd)
+        {
+            if (_paused || !Enabled || hwnd == IntPtr.Zero) return;
+            if (!Native.IsWindow(hwnd) || !Native.IsTopLevel(hwnd)) return;
+
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            if (GetProcessApp(pid) != _app) return;
+
+            string title = Native.Title(hwnd);
+            string cls = Native.ClassName(hwnd);
+            if (_app == PreviewApp.QQ)
+            {
+                if (!string.Equals(cls, ChromeClass, StringComparison.Ordinal)) return;
+            }
+            else
+            {
+                if (!cls.StartsWith("Qt", StringComparison.Ordinal)) return;
+            }
+
+            bool candidateTitle = title.Length == 0 ||
+                (_app == PreviewApp.WeChat &&
+                 string.Equals(title, "Weixin", StringComparison.OrdinalIgnoreCase));
+            if (!candidateTitle) return;
+
+            // Only the real preview window: independent top-level, resizable,
+            // no owner, not a popup/menu/IME, and roughly the size we saved last time.
+            if (Native.GetWindow(hwnd, Native.GW_OWNER) != IntPtr.Zero) return;
+            int style = Native.GetWindowLong(hwnd, Native.GWL_STYLE);
+            if ((style & Native.WS_THICKFRAME) == 0) return;
+            int styleEx = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
+            int transient = Native.WS_EX_TOPMOST | Native.WS_EX_TOOLWINDOW |
+                            Native.WS_EX_NOACTIVATE | Native.WS_EX_TRANSPARENT;
+            if ((styleEx & transient) != 0) return;
+            if (!MatchesSavedSize(hwnd)) return;
+
+            if (_cloaked.ContainsKey(hwnd))
+            {
+                HideCandidate(hwnd);
+                return;
+            }
+
+            HideCandidate(hwnd);
+
+            // Keep alpha=0 as a second guard in case Qt shows the window again
+            // before we reveal it with the final position/alpha.
+            int ex = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
+            _candidateOriginalEx[hwnd] = ex;
+
+            if ((ex & Native.WS_EX_LAYERED) == 0)
+            {
+                Native.SetWindowLong(hwnd, Native.GWL_EXSTYLE, ex | Native.WS_EX_LAYERED);
+                Native.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER |
+                    Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+            }
+            Native.SetLayeredWindowAttributes(hwnd, 0, 0, Native.LWA_ALPHA);
+            _cloaked[hwnd] = DateTime.Now;
+            StartFast(hwnd, 0, 1500);
+            ConfigStore.Log(AppName + "：按上次尺寸锁定候选窗口 hwnd=0x" +
+                hwnd.ToInt64().ToString("X"));
+        }
+
+        private bool MatchesSavedSize(IntPtr hwnd)
+        {
+            RectI r = Native.GetRect(hwnd);
+            if (r == null || r.W < 100 || r.H < 100) return false;
+
+            if (_app == PreviewApp.WeChat)
+            {
+                return MatchesRect(_cfg.WeChatMedia, r);
+            }
+            return MatchesRect(_cfg.Image, r) || MatchesRect(_cfg.Video, r);
+        }
+
+        private static bool MatchesRect(RectData saved, RectI r)
+        {
+            if (saved == null || saved.W <= 0 || saved.H <= 0) return false;
+
+            int toleranceW = Math.Max(24, saved.W / 10);
+            int toleranceH = Math.Max(24, saved.H / 10);
+            return Math.Abs(r.W - saved.W) <= toleranceW &&
+                   Math.Abs(r.H - saved.H) <= toleranceH;
+        }
+
+        private void HideCandidate(IntPtr hwnd)
+        {
+            if (!Native.IsWindow(hwnd)) return;
+            if (!_hiddenCandidates.Add(hwnd)) return;
+
+            Native.ShowWindow(hwnd, Native.SW_HIDE);
+            ConfigStore.Log(AppName + "：候选窗口先隐藏 hwnd=0x" +
+                hwnd.ToInt64().ToString("X"));
+        }
+
+        private void RevealCandidate(IntPtr hwnd)
+        {
+            if (!_hiddenCandidates.Remove(hwnd)) return;
+            if (Native.IsWindow(hwnd))
+            {
+                _revealing = true;
+                Native.ShowWindow(hwnd, Native.SW_SHOWNOACTIVATE);
+                _revealing = false;
+            }
+            ConfigStore.Log(AppName + "：候选窗口恢复显示 hwnd=0x" +
+                hwnd.ToInt64().ToString("X"));
+        }
+
+        private void Uncloak(IntPtr hwnd)
+        {
+            if (!_cloaked.Remove(hwnd)) return;
+            StopFast();
+            UncloakDwm(hwnd);
+
+            int originalEx;
+            if (_candidateOriginalEx.TryGetValue(hwnd, out originalEx))
+            {
+                _candidateOriginalEx.Remove(hwnd);
+                Native.SetWindowLong(hwnd, Native.GWL_EXSTYLE, originalEx);
+                Native.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER |
+                    Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+                if ((originalEx & Native.WS_EX_LAYERED) != 0)
+                {
+                    Native.SetLayeredWindowAttributes(hwnd, 0, 255, Native.LWA_ALPHA);
+                }
+            }
+            else
+            {
+                Native.SetCloaked(hwnd, false);
+            }
+
+            ConfigStore.Log(AppName + "：恢复显示 hwnd=0x" + hwnd.ToInt64().ToString("X"));
+        }
+
+        private bool TryDwmCloak(IntPtr hwnd)
+        {
+            if (_dwmCloaked.Contains(hwnd)) return true;
+            if (!Native.SetCloaked(hwnd, true)) return false;
+
+            _dwmCloaked.Add(hwnd);
+            ConfigStore.Log(AppName + "：DWM 隐藏成功 hwnd=0x" + hwnd.ToInt64().ToString("X"));
+            return true;
+        }
+
+        private void UncloakDwm(IntPtr hwnd)
+        {
+            if (_dwmCloaked.Remove(hwnd))
+            {
+                Native.SetCloaked(hwnd, false);
+            }
+        }
+
+        private void ForgetCandidate(IntPtr hwnd)
+        {
+            UncloakDwm(hwnd);
+            if (_candidateOriginalEx.Remove(hwnd))
+            {
+                _cloaked.Remove(hwnd);
+                return;
+            }
+            if (_cloaked.Remove(hwnd))
+            {
+                Native.SetCloaked(hwnd, false);
+            }
+        }
+
+        private void UncloakAll()
+        {
+            if (_cloaked.Count == 0) return;
+            IntPtr[] keys = new IntPtr[_cloaked.Count];
+            _cloaked.Keys.CopyTo(keys, 0);
+            foreach (IntPtr h in keys)
+            {
+                Uncloak(h);
+            }
+        }
+
+        private void CloakTimerTick(object sender, EventArgs e)
+        {
+            if (_cloaked.Count == 0) return;
+            IntPtr[] keys = new IntPtr[_cloaked.Count];
+            _cloaked.Keys.CopyTo(keys, 0);
+            DateTime now = DateTime.Now;
+            foreach (IntPtr h in keys)
+            {
+                DateTime since;
+                if (!_cloaked.TryGetValue(h, out since)) continue;
+                if (!Native.IsWindow(h) || (now - since).TotalSeconds > 2.0)
+                {
+                    Uncloak(h);
+                }
+            }
+        }
+
+        private void StartFast(IntPtr hwnd, int percent, int milliseconds)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            _fastHwnd = hwnd;
+            _fastPercent = percent;
+            _fastUntil = DateTime.Now.AddMilliseconds(milliseconds);
+            _fastTimer.Stop();
+            _fastTimer.Start();
+        }
+
+        private void StopFast()
+        {
+            _fastTimer.Stop();
+            _fastHwnd = IntPtr.Zero;
+        }
+
+        private void FastTimerTick(object sender, EventArgs e)
+        {
+            if (_fastHwnd == IntPtr.Zero || DateTime.Now > _fastUntil || !Native.IsWindow(_fastHwnd))
+            {
+                StopFast();
+                return;
+            }
+
+            int desired = _fastPercent * 255 / 100;
+            byte readAlpha;
+            uint readKey;
+            uint readFlags;
+            bool hasAlpha = Native.GetLayeredWindowAttributes(_fastHwnd, out readKey, out readAlpha, out readFlags);
+            if (!hasAlpha || readAlpha != (byte)desired)
+            {
+                ApplyAlphaInternal(_fastHwnd, _fastPercent);
+            }
         }
 
         private void ApplyAlphaInternal(IntPtr hwnd, int percent)

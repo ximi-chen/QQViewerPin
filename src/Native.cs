@@ -10,8 +10,13 @@ namespace QQViewerPin
 
         public const int WS_EX_LAYERED = 0x00080000;
         public const int WS_EX_TOOLWINDOW = 0x00000080;
+        public const int WS_EX_TOPMOST = 0x00000008;
+        public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_APPWINDOW = 0x00040000;
         public const int WS_EX_NOACTIVATE = 0x08000000;
+        public const int WS_THICKFRAME = 0x00040000;
+        public const int GWL_STYLE = -16;
+        public const int GW_OWNER = 4;
 
         public const uint SWP_NOSIZE = 0x0001;
         public const uint SWP_NOMOVE = 0x0002;
@@ -19,6 +24,7 @@ namespace QQViewerPin
         public const uint SWP_NOACTIVATE = 0x0010;
         public const uint SWP_FRAMECHANGED = 0x0020;
 
+        public const int SW_HIDE = 0;
         public const int SW_MINIMIZE = 6;
         public const int SW_RESTORE = 9;
         public const int SW_SHOWNOACTIVATE = 4;
@@ -127,6 +133,9 @@ namespace QQViewerPin
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
+
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
         public static extern int GetWindowLong(IntPtr hWnd, int index);
 
@@ -202,6 +211,23 @@ namespace QQViewerPin
 
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        public static bool SetCloaked(IntPtr hwnd, bool cloaked)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            int value = cloaked ? 1 : 0;
+            try
+            {
+                return DwmSetWindowAttribute(hwnd, 13, ref value, 4) == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         [DllImport("kernel32.dll")]
         public static extern IntPtr GetCurrentProcess();

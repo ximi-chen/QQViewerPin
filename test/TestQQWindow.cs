@@ -5,7 +5,7 @@ namespace TestQQWindow
 {
     internal static class Program
     {
-        private const string ClassName = "Chrome_WidgetWin_1";
+        private static string ClassName = "Chrome_WidgetWin_1";
 
         private const uint WS_OVERLAPPEDWINDOW = 0x00CF0000;
         private const uint WS_VISIBLE = 0x10000000;
@@ -64,6 +64,9 @@ namespace TestQQWindow
             IntPtr instance, IntPtr param);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool SetWindowText(IntPtr hWnd, string text);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
@@ -98,9 +101,19 @@ namespace TestQQWindow
         [STAThread]
         private static int Main(string[] args)
         {
-            string title = args.Length > 0 ? args[0] : "图片查看器";
-            int width = args.Length > 2 ? int.Parse(args[1]) : 600;
-            int height = args.Length > 3 ? int.Parse(args[2]) : 800;
+            string exeName = System.IO.Path.GetFileName(
+                System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName);
+            if (string.Equals(exeName, "Weixin.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                ClassName = "Qt51514QWindowIcon";
+            }
+
+            bool lateTitle = args.Length > 0 && args[0] == "--late";
+            string title = lateTitle
+                ? (args.Length > 1 ? args[1] : "图片查看器")
+                : (args.Length > 0 ? args[0] : "图片查看器");
+            int width = 900;
+            int height = 700;
 
             _wndProc = WindowProc;
 
@@ -118,11 +131,18 @@ namespace TestQQWindow
                 return 2;
             }
 
-            IntPtr hwnd = CreateWindowEx(0, ClassName, title,
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE, 120, 120, width, height,
+            uint style = WS_OVERLAPPEDWINDOW | (lateTitle ? 0 : WS_VISIBLE);
+            IntPtr hwnd = CreateWindowEx(0, ClassName, lateTitle ? "" : title,
+                style, 120, 120, width, height,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
             if (hwnd == IntPtr.Zero) return 3;
+
+            if (lateTitle)
+            {
+                System.Threading.Thread.Sleep(1200);
+                SetWindowText(hwnd, title);
+            }
 
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
