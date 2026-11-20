@@ -1,0 +1,18 @@
+# Build output
+/dist/
+/QQViewerPin.exe
+
+# Test output and local data
+/testdata/
+/selftest.log
+/test/*.exe
+/test/*-out.txt
+/test/*-err.txt
+*.log
+
+# IDE / OS junk
+.vs/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
