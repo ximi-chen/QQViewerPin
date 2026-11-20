@@ -57,6 +57,18 @@ namespace QQViewerPin
         [DataMember(Name = "closeHotkeyKey", Order = 11)]
         public uint CloseHotkeyKey;
 
+        [DataMember(Name = "weChatMedia", Order = 12)]
+        public RectData WeChatMedia;
+
+        [DataMember(Name = "qqEnabled", Order = 13)]
+        public bool QQEnabled;
+
+        [DataMember(Name = "weChatEnabled", Order = 14)]
+        public bool WeChatEnabled;
+
+        [DataMember(Name = "weChatAlpha", Order = 15)]
+        public int WeChatAlpha;
+
         public AppConfig()
         {
             Alpha = 50;
@@ -64,6 +76,9 @@ namespace QQViewerPin
             AutoStart = false;
             HotkeyEnabled = true;
             CloseHotkeyEnabled = true;
+            QQEnabled = true;
+            WeChatEnabled = true;
+            WeChatAlpha = 50;
         }
 
         [OnDeserializing]
@@ -73,6 +88,9 @@ namespace QQViewerPin
             HideFromTaskbar = true;
             HotkeyEnabled = true;
             CloseHotkeyEnabled = true;
+            QQEnabled = true;
+            WeChatEnabled = true;
+            WeChatAlpha = 50;
         }
     }
 
@@ -105,6 +123,7 @@ namespace QQViewerPin
                     if (cfg.Alpha < 10 || cfg.Alpha > 100) cfg.Alpha = 50;
                     cfg.Image = Validate(cfg.Image);
                     cfg.Video = Validate(cfg.Video);
+                    cfg.WeChatMedia = Validate(cfg.WeChatMedia);
                     return cfg;
                 }
             }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -9,13 +10,18 @@ namespace QQViewerPin
     internal sealed class TrayApp : ApplicationContext
     {
         private readonly AppConfig _cfg;
-        private readonly PreviewManager _mgr;
+        private readonly PreviewManager _mgrQQ;
+        private readonly PreviewManager _mgrWeChat;
         private readonly HudForm _hud;
         private readonly NotifyIcon _tray;
         private readonly MessageWindow _msg;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _alphaMenu;
+        private readonly ToolStripMenuItem _alphaQQMenu;
+        private readonly ToolStripMenuItem _alphaWeChatMenu;
         private readonly ToolStripMenuItem _pauseItem;
+        private readonly ToolStripMenuItem _qqToggleItem;
+        private readonly ToolStripMenuItem _weChatToggleItem;
         private readonly ToolStripMenuItem _hotkeyItem;
         private readonly ToolStripMenuItem _closeHotkeyItem;
         private readonly ToolStripMenuItem _closeAllItem;
@@ -34,14 +40,31 @@ namespace QQViewerPin
         private bool _closeHotkeyNoticeWarning;
         private bool _cleaned;
 
+        private sealed class AlphaPreset
+        {
+            public readonly PreviewApp App;
+            public readonly int Percent;
+
+            public AlphaPreset(PreviewApp app, int percent)
+            {
+                App = app;
+                Percent = percent;
+            }
+        }
+
         public TrayApp(AppConfig cfg, bool firstRun, bool selftest)
         {
             _cfg = cfg;
 
             _hud = new HudForm();
-            _mgr = new PreviewManager(cfg);
-            _mgr.AlphaChanged += OnAlphaChanged;
-            _mgr.Start();
+
+            _mgrQQ = new PreviewManager(cfg, PreviewApp.QQ);
+            _mgrQQ.AlphaChanged += OnAlphaChanged;
+            _mgrQQ.Start();
+
+            _mgrWeChat = new PreviewManager(cfg, PreviewApp.WeChat);
+            _mgrWeChat.AlphaChanged += OnAlphaChanged;
+            _mgrWeChat.Start();
 
             _msg = new MessageWindow();
             _msg.HotkeyPressed += OnHotkey;
@@ -52,30 +75,30 @@ namespace QQViewerPin
             _menu = new ContextMenuStrip();
 
             _alphaMenu = new ToolStripMenuItem("透明度");
-            int[] presets = new int[] { 100, 70, 50, 30, 10 };
-            foreach (int preset in presets)
-            {
-                ToolStripMenuItem item = new ToolStripMenuItem(preset + "%");
-                item.Tag = preset;
-                item.Click += AlphaPresetClick;
-                _alphaMenu.DropDownItems.Add(item);
-            }
-            _alphaMenu.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem hint = new ToolStripMenuItem("Alt+滚轮微调（每格 5%）");
-            hint.Enabled = false;
-            _alphaMenu.DropDownItems.Add(hint);
+            _alphaQQMenu = BuildAlphaMenu(PreviewApp.QQ, "QQ");
+            _alphaWeChatMenu = BuildAlphaMenu(PreviewApp.WeChat, "微信");
+            _alphaMenu.DropDownItems.Add(_alphaQQMenu);
+            _alphaMenu.DropDownItems.Add(_alphaWeChatMenu);
 
             _pauseItem = new ToolStripMenuItem("暂停接管");
             _pauseItem.Click += PauseClick;
 
-            _hotkeyItem = new ToolStripMenuItem("设置快捷键...");
-            _hotkeyItem.Click += HotkeyClick;
+            _qqToggleItem = new ToolStripMenuItem("接管 QQ");
+            _qqToggleItem.Checked = _cfg.QQEnabled;
+            _qqToggleItem.Click += QqToggleClick;
 
-            _closeAllItem = new ToolStripMenuItem("关闭所有预览窗");
-            _closeAllItem.Click += CloseAllClick;
+            _weChatToggleItem = new ToolStripMenuItem("接管微信");
+            _weChatToggleItem.Checked = _cfg.WeChatEnabled;
+            _weChatToggleItem.Click += WeChatToggleClick;
+
+            _hotkeyItem = new ToolStripMenuItem("设置快速隐藏快捷键...");
+            _hotkeyItem.Click += HotkeyClick;
 
             _closeHotkeyItem = new ToolStripMenuItem("设置关闭快捷键...");
             _closeHotkeyItem.Click += CloseHotkeyClick;
+
+            _closeAllItem = new ToolStripMenuItem("关闭所有预览窗");
+            _closeAllItem.Click += CloseAllClick;
 
             _autoStartItem = new ToolStripMenuItem("开机自启");
             _autoStartItem.Click += AutoStartClick;
@@ -89,6 +112,8 @@ namespace QQViewerPin
             _menu.Items.Add(_alphaMenu);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_pauseItem);
+            _menu.Items.Add(_qqToggleItem);
+            _menu.Items.Add(_weChatToggleItem);
             _menu.Items.Add(_hotkeyItem);
             _menu.Items.Add(_closeHotkeyItem);
             _menu.Items.Add(_closeAllItem);
@@ -100,7 +125,7 @@ namespace QQViewerPin
 
             _tray = new NotifyIcon();
             _tray.Icon = SystemIcons.Application;
-            _tray.Text = "QQ 预览窗固定器";
+            _tray.Text = "QQ / 微信预览窗固定器";
             _tray.ContextMenuStrip = _menu;
             _tray.Visible = true;
             _tray.DoubleClick += TrayDoubleClick;
@@ -133,7 +158,7 @@ namespace QQViewerPin
             }
             else if (startupNotice != null)
             {
-                _tray.ShowBalloonTip(8000, "QQ 预览窗固定器", startupNotice,
+                _tray.ShowBalloonTip(8000, "QQViewerPin", startupNotice,
                     startupWarning ? ToolTipIcon.Warning : ToolTipIcon.Info);
             }
             else if (firstRun)
@@ -145,11 +170,30 @@ namespace QQViewerPin
                 }
                 if (_closeHotkeyRegistered)
                 {
-                    tip += "关闭全部预览窗：" + HotkeyUtil.Format(_closeHotkeyMods, _closeHotkeyKey) + "；";
+                    tip += "关闭全部：" + HotkeyUtil.Format(_closeHotkeyMods, _closeHotkeyKey) + "；";
                 }
-                tip += "Alt+滚轮调透明度。右键托盘图标可改快捷键。";
-                _tray.ShowBalloonTip(5000, "QQ 预览窗固定器", tip, ToolTipIcon.Info);
+                tip += "Alt+滚轮调透明度。右键托盘图标可设快捷键。";
+                _tray.ShowBalloonTip(5000, "QQViewerPin", tip, ToolTipIcon.Info);
             }
+        }
+
+        private ToolStripMenuItem BuildAlphaMenu(PreviewApp app, string label)
+        {
+            ToolStripMenuItem menu = new ToolStripMenuItem(label);
+            int[] presets = new int[] { 100, 70, 50, 30, 10 };
+            foreach (int preset in presets)
+            {
+                ToolStripMenuItem item = new ToolStripMenuItem(preset + "%");
+                item.Tag = new AlphaPreset(app, preset);
+                item.Click += AlphaPresetClick;
+                menu.DropDownItems.Add(item);
+            }
+            return menu;
+        }
+
+        private PreviewManager Manager(PreviewApp app)
+        {
+            return app == PreviewApp.QQ ? _mgrQQ : _mgrWeChat;
         }
 
         private void InitializeHotkey()
@@ -175,7 +219,7 @@ namespace QQViewerPin
                 }
                 else
                 {
-                    _hotkeyNotice = "快捷键 " + name + " 被其他程序占用，快速隐藏暂不可用。请右键托盘图标 → 设置快捷键。";
+                    _hotkeyNotice = "快捷键 " + name + " 被其他程序占用，快速隐藏暂不可用。请右键托盘图标 → 设置快速隐藏快捷键。";
                     _hotkeyNoticeWarning = true;
                     ConfigStore.Log("快捷键 " + name + " 注册失败，错误码 " + Marshal.GetLastWin32Error());
                 }
@@ -210,7 +254,7 @@ namespace QQViewerPin
                 }
             }
 
-            _hotkeyNotice = "没有可用的默认快捷键（Alt+`、Ctrl+`、Ctrl+Alt+Q 均被占用）。请右键托盘图标 → 设置快捷键。";
+            _hotkeyNotice = "没有可用的默认快捷键（Alt+`、Ctrl+`、Ctrl+Alt+Q 均被占用）。请右键托盘图标 → 设置快速隐藏快捷键。";
             _hotkeyNoticeWarning = true;
             ConfigStore.Log("注册热键失败：Alt+`、Ctrl+`、Ctrl+Alt+Q 均被占用，错误码 " + Marshal.GetLastWin32Error());
             UpdateHotkeyMenu();
@@ -286,27 +330,6 @@ namespace QQViewerPin
             UpdateHotkeyMenu();
         }
 
-        private bool TryRegisterCloseHotkey(uint mods, uint vk)
-        {
-            if (!Native.RegisterHotKey(_msg.Handle, Native.HOTKEY_ID_CLOSE, mods, vk)) return false;
-
-            _closeHotkeyRegistered = true;
-            _closeHotkeyMods = mods;
-            _closeHotkeyKey = vk;
-            UpdateHotkeyMenu();
-            return true;
-        }
-
-        private void UnregisterCloseHotkey()
-        {
-            if (_closeHotkeyRegistered)
-            {
-                Native.UnregisterHotKey(_msg.Handle, Native.HOTKEY_ID_CLOSE);
-                _closeHotkeyRegistered = false;
-            }
-        }
-
-
         private bool TryRegisterHotkey(uint mods, uint vk)
         {
             if (!Native.RegisterHotKey(_msg.Handle, Native.HOTKEY_ID, mods, vk)) return false;
@@ -318,12 +341,32 @@ namespace QQViewerPin
             return true;
         }
 
+        private bool TryRegisterCloseHotkey(uint mods, uint vk)
+        {
+            if (!Native.RegisterHotKey(_msg.Handle, Native.HOTKEY_ID_CLOSE, mods, vk)) return false;
+
+            _closeHotkeyRegistered = true;
+            _closeHotkeyMods = mods;
+            _closeHotkeyKey = vk;
+            UpdateHotkeyMenu();
+            return true;
+        }
+
         private void UnregisterCurrent()
         {
             if (_hotkeyRegistered)
             {
                 Native.UnregisterHotKey(_msg.Handle, Native.HOTKEY_ID);
                 _hotkeyRegistered = false;
+            }
+        }
+
+        private void UnregisterCloseHotkey()
+        {
+            if (_closeHotkeyRegistered)
+            {
+                Native.UnregisterHotKey(_msg.Handle, Native.HOTKEY_ID_CLOSE);
+                _closeHotkeyRegistered = false;
             }
         }
 
@@ -361,7 +404,7 @@ namespace QQViewerPin
 
             try
             {
-                using (HotkeyForm form = new HotkeyForm(wasEnabled, oldMods, oldKey, ApplyHotkey))
+                using (HotkeyForm form = new HotkeyForm(wasEnabled, oldMods, oldKey, ApplyHotkey, "快速隐藏"))
                 {
                     form.ShowDialog();
                 }
@@ -376,6 +419,39 @@ namespace QQViewerPin
                 if (!TryRegisterHotkey(_hotkeyMods, _hotkeyKey))
                 {
                     ConfigStore.Log("恢复原快捷键失败：" + HotkeyUtil.Format(_hotkeyMods, _hotkeyKey));
+                }
+            }
+            UpdateHotkeyMenu();
+        }
+
+        private void CloseHotkeyClick(object sender, EventArgs e)
+        {
+            uint oldMods = _closeHotkeyMods;
+            uint oldKey = _closeHotkeyKey;
+            bool wasEnabled = _closeHotkeyEnabled;
+
+            UnregisterCloseHotkey();
+
+            try
+            {
+                using (HotkeyForm form = new HotkeyForm(wasEnabled, oldMods, oldKey,
+                    ApplyCloseHotkey, "关闭所有预览窗"))
+                {
+                    form.ShowDialog();
+                }
+            }
+            catch (Exception ex)
+            {
+                ConfigStore.Log("打开关闭快捷键设置失败：" + ex.Message);
+            }
+
+            if (!_closeHotkeyRegistered && _closeHotkeyEnabled &&
+                _closeHotkeyMods != 0 && _closeHotkeyKey != 0)
+            {
+                if (!TryRegisterCloseHotkey(_closeHotkeyMods, _closeHotkeyKey))
+                {
+                    ConfigStore.Log("恢复关闭快捷键失败：" +
+                        HotkeyUtil.Format(_closeHotkeyMods, _closeHotkeyKey));
                 }
             }
             UpdateHotkeyMenu();
@@ -422,39 +498,6 @@ namespace QQViewerPin
             return false;
         }
 
-        private void CloseHotkeyClick(object sender, EventArgs e)
-        {
-            uint oldMods = _closeHotkeyMods;
-            uint oldKey = _closeHotkeyKey;
-            bool wasEnabled = _closeHotkeyEnabled;
-
-            UnregisterCloseHotkey();
-
-            try
-            {
-                using (HotkeyForm form = new HotkeyForm(wasEnabled, oldMods, oldKey,
-                    ApplyCloseHotkey, "关闭所有预览窗"))
-                {
-                    form.ShowDialog();
-                }
-            }
-            catch (Exception ex)
-            {
-                ConfigStore.Log("打开关闭快捷键设置失败：" + ex.Message);
-            }
-
-            if (!_closeHotkeyRegistered && _closeHotkeyEnabled &&
-                _closeHotkeyMods != 0 && _closeHotkeyKey != 0)
-            {
-                if (!TryRegisterCloseHotkey(_closeHotkeyMods, _closeHotkeyKey))
-                {
-                    ConfigStore.Log("恢复关闭快捷键失败：" +
-                        HotkeyUtil.Format(_closeHotkeyMods, _closeHotkeyKey));
-                }
-            }
-            UpdateHotkeyMenu();
-        }
-
         private bool ApplyCloseHotkey(bool enabled, uint mods, uint vk, out string error)
         {
             error = null;
@@ -499,12 +542,13 @@ namespace QQViewerPin
 
         private void OnAlphaChanged(object sender, AlphaChangedEventArgs e)
         {
-            _hud.ShowText("透明度 " + e.Percent + "%", AnchorRect());
+            _hud.ShowText((e.App == PreviewApp.QQ ? "QQ" : "微信") + " 透明度 " + e.Percent + "%",
+                AnchorRect(e.App));
         }
 
-        private Rectangle AnchorRect()
+        private Rectangle AnchorRect(PreviewApp app)
         {
-            IntPtr h = _mgr.ActiveWindow;
+            IntPtr h = Manager(app).ActiveWindow;
             if (h != IntPtr.Zero)
             {
                 Native.RECT r;
@@ -522,20 +566,39 @@ namespace QQViewerPin
         private void AlphaPresetClick(object sender, EventArgs e)
         {
             ToolStripMenuItem item = sender as ToolStripMenuItem;
-            if (item == null || !(item.Tag is int)) return;
-            _mgr.SetAlpha((int)item.Tag);
+            AlphaPreset preset = item == null ? null : item.Tag as AlphaPreset;
+            if (preset == null) return;
+            Manager(preset.App).SetAlpha(preset.Percent);
         }
 
         private void PauseClick(object sender, EventArgs e)
         {
-            _mgr.Paused = !_mgr.Paused;
-            _pauseItem.Checked = _mgr.Paused;
+            bool paused = !_mgrQQ.Paused;
+            _mgrQQ.Paused = paused;
+            _mgrWeChat.Paused = paused;
+            _pauseItem.Checked = paused;
         }
 
         private void TrayDoubleClick(object sender, EventArgs e)
         {
-            _mgr.Paused = !_mgr.Paused;
-            _pauseItem.Checked = _mgr.Paused;
+            bool paused = !_mgrQQ.Paused;
+            _mgrQQ.Paused = paused;
+            _mgrWeChat.Paused = paused;
+            _pauseItem.Checked = paused;
+        }
+
+        private void QqToggleClick(object sender, EventArgs e)
+        {
+            _cfg.QQEnabled = !_cfg.QQEnabled;
+            _qqToggleItem.Checked = _cfg.QQEnabled;
+            ConfigStore.Save(_cfg);
+        }
+
+        private void WeChatToggleClick(object sender, EventArgs e)
+        {
+            _cfg.WeChatEnabled = !_cfg.WeChatEnabled;
+            _weChatToggleItem.Checked = _cfg.WeChatEnabled;
+            ConfigStore.Save(_cfg);
         }
 
         private void AutoStartClick(object sender, EventArgs e)
@@ -549,28 +612,38 @@ namespace QQViewerPin
 
         private void ResetClick(object sender, EventArgs e)
         {
-            _mgr.ResetPositions();
-            _hud.ShowText("位置已重置", AnchorRect());
+            _mgrQQ.ResetPositions();
+            _mgrWeChat.ResetPositions();
+            _hud.ShowText("位置已重置", AnchorRect(PreviewApp.QQ));
         }
 
         private void MenuOpening(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            _pauseItem.Checked = _mgr.Paused;
+            _pauseItem.Checked = _mgrQQ.Paused;
+            _qqToggleItem.Checked = _cfg.QQEnabled;
+            _weChatToggleItem.Checked = _cfg.WeChatEnabled;
             _autoStartItem.Checked = AutoStartHelper.IsEnabled();
             UpdateHotkeyMenu();
 
-            foreach (ToolStripItem item in _alphaMenu.DropDownItems)
+            CheckAlphaMenu(_alphaQQMenu, _mgrQQ.Alpha);
+            CheckAlphaMenu(_alphaWeChatMenu, _mgrWeChat.Alpha);
+        }
+
+        private static void CheckAlphaMenu(ToolStripMenuItem menu, int alpha)
+        {
+            foreach (ToolStripItem item in menu.DropDownItems)
             {
                 ToolStripMenuItem mi = item as ToolStripMenuItem;
-                if (mi == null || !(mi.Tag is int)) continue;
-                mi.Checked = ((int)mi.Tag == _cfg.Alpha);
+                AlphaPreset preset = mi == null ? null : mi.Tag as AlphaPreset;
+                if (preset == null) continue;
+                mi.Checked = preset.Percent == alpha;
             }
         }
 
         private void OnHotkey(object sender, EventArgs e)
         {
             if (!_hotkeyRegistered) return;
-            _mgr.ToggleActiveMinimize();
+            ToggleAllMinimize();
         }
 
         private void OnCloseAllHotkey(object sender, EventArgs e)
@@ -579,11 +652,42 @@ namespace QQViewerPin
             CloseAllClick(sender, e);
         }
 
+        private void ToggleAllMinimize()
+        {
+            List<IntPtr> all = new List<IntPtr>();
+            _mgrQQ.CollectManagedWindows(all);
+            _mgrWeChat.CollectManagedWindows(all);
+
+            if (all.Count == 0)
+            {
+                _hud.ShowText("没有可隐藏的预览窗", AnchorRect(PreviewApp.QQ));
+                return;
+            }
+
+            bool hide = false;
+            foreach (IntPtr h in all)
+            {
+                if (!Native.IsIconic(h))
+                {
+                    hide = true;
+                    break;
+                }
+            }
+
+            foreach (IntPtr h in all)
+            {
+                Native.ShowWindow(h, hide ? Native.SW_MINIMIZE : Native.SW_RESTORE);
+            }
+
+            _hud.ShowText((hide ? "已隐藏 " : "已还原 ") + all.Count + " 个预览窗",
+                AnchorRect(PreviewApp.QQ));
+        }
+
         private void CloseAllClick(object sender, EventArgs e)
         {
-            int count = _mgr.CloseAllPreviews();
+            int count = _mgrQQ.CloseAllPreviews() + _mgrWeChat.CloseAllPreviews();
             _hud.ShowText(count > 0 ? "已关闭 " + count + " 个预览窗" : "没有打开的预览窗",
-                AnchorRect());
+                AnchorRect(PreviewApp.QQ));
         }
 
         private void ExitClick(object sender, EventArgs e)
@@ -597,11 +701,15 @@ namespace QQViewerPin
             if (_cleaned) return;
             _cleaned = true;
 
-            try { _mgr.SaveNow(); }
-            catch (Exception ex) { ConfigStore.Log("退出保存失败：" + ex.Message); }
+            try { _mgrQQ.SaveNow(); }
+            catch (Exception ex) { ConfigStore.Log("QQ 退出保存失败：" + ex.Message); }
+            try { _mgrWeChat.SaveNow(); }
+            catch (Exception ex) { ConfigStore.Log("微信退出保存失败：" + ex.Message); }
 
-            try { _mgr.Shutdown(); }
-            catch (Exception ex) { ConfigStore.Log("退出清理失败：" + ex.Message); }
+            try { _mgrQQ.Shutdown(); }
+            catch (Exception ex) { ConfigStore.Log("QQ 退出清理失败：" + ex.Message); }
+            try { _mgrWeChat.Shutdown(); }
+            catch (Exception ex) { ConfigStore.Log("微信退出清理失败：" + ex.Message); }
 
             UnregisterCurrent();
             UnregisterCloseHotkey();

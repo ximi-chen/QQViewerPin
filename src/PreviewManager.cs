@@ -5,19 +5,29 @@ using System.Windows.Forms;
 
 namespace QQViewerPin
 {
+    internal enum PreviewApp
+    {
+        None,
+        QQ,
+        WeChat
+    }
+
     internal enum PreviewType
     {
         None,
         Image,
-        Video
+        Video,
+        Media
     }
 
     internal sealed class AlphaChangedEventArgs : EventArgs
     {
+        public readonly PreviewApp App;
         public readonly int Percent;
 
-        public AlphaChangedEventArgs(int percent)
+        public AlphaChangedEventArgs(PreviewApp app, int percent)
         {
+            App = app;
             Percent = percent;
         }
     }
@@ -25,8 +35,10 @@ namespace QQViewerPin
     internal sealed class PreviewManager
     {
         private const string ChromeClass = "Chrome_WidgetWin_1";
+        private const string WeChatTitle = "图片和视频";
 
         private readonly AppConfig _cfg;
+        private readonly PreviewApp _app;
 
         private Native.WinEventDelegate _winEventProc;
         private Native.LowLevelMouseProc _mouseProc;
@@ -42,19 +54,21 @@ namespace QQViewerPin
 
         private readonly Timer _saveTimer;
         private readonly Timer _guardTimer;
+        private readonly Timer _maintenanceTimer;
         private readonly Timer _retryTimer;
         private int _guardTicks;
         private readonly List<IntPtr> _pending = new List<IntPtr>();
 
-        private readonly Dictionary<uint, bool> _procCache = new Dictionary<uint, bool>();
+        private readonly Dictionary<uint, PreviewApp> _procCache = new Dictionary<uint, PreviewApp>();
         private bool _paused;
         private bool _started;
 
         public event EventHandler<AlphaChangedEventArgs> AlphaChanged;
 
-        public PreviewManager(AppConfig cfg)
+        public PreviewManager(AppConfig cfg, PreviewApp app)
         {
             _cfg = cfg;
+            _app = app;
 
             _saveTimer = new Timer();
             _saveTimer.Interval = 600;
@@ -64,14 +78,28 @@ namespace QQViewerPin
             _guardTimer.Interval = 100;
             _guardTimer.Tick += GuardTimerTick;
 
+            _maintenanceTimer = new Timer();
+            _maintenanceTimer.Interval = 1000;
+            _maintenanceTimer.Tick += MaintenanceTimerTick;
+
             _retryTimer = new Timer();
             _retryTimer.Interval = 150;
             _retryTimer.Tick += RetryTimerTick;
         }
 
+        public PreviewApp App
+        {
+            get { return _app; }
+        }
+
         public AppConfig Config
         {
             get { return _cfg; }
+        }
+
+        public bool Enabled
+        {
+            get { return _app == PreviewApp.QQ ? _cfg.QQEnabled : _cfg.WeChatEnabled; }
         }
 
         public bool Paused
@@ -98,6 +126,11 @@ namespace QQViewerPin
             get { return _activeType; }
         }
 
+        public int Alpha
+        {
+            get { return GetAlpha(); }
+        }
+
         public void Start()
         {
             if (_started) return;
@@ -110,7 +143,7 @@ namespace QQViewerPin
                 Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
             if (_winEventHook == IntPtr.Zero)
             {
-                ConfigStore.Log("SetWinEventHook 失败，错误码 " + Marshal.GetLastWin32Error());
+                ConfigStore.Log(AppName + "：SetWinEventHook 失败，错误码 " + Marshal.GetLastWin32Error());
             }
 
             _mouseProc = MouseHookProc;
@@ -118,10 +151,11 @@ namespace QQViewerPin
                 Native.GetModuleHandle(null), 0);
             if (_mouseHook == IntPtr.Zero)
             {
-                ConfigStore.Log("鼠标钩子安装失败，错误码 " + Marshal.GetLastWin32Error());
+                ConfigStore.Log(AppName + "：鼠标钩子安装失败，错误码 " + Marshal.GetLastWin32Error());
             }
 
-            ConfigStore.Log("已启动。");
+            _maintenanceTimer.Start();
+            ConfigStore.Log(AppName + "：已启动。");
         }
 
         public void Shutdown()
@@ -142,11 +176,12 @@ namespace QQViewerPin
 
             _saveTimer.Stop();
             _guardTimer.Stop();
+            _maintenanceTimer.Stop();
             _retryTimer.Stop();
 
             RestoreActiveStyle();
             ConfigStore.Save(_cfg);
-            ConfigStore.Log("已退出。");
+            ConfigStore.Log(AppName + "：已退出。");
         }
 
         public void SaveNow()
@@ -159,7 +194,9 @@ namespace QQViewerPin
         {
             if (percent < 10) percent = 10;
             if (percent > 100) percent = 100;
-            _cfg.Alpha = percent;
+
+            if (_app == PreviewApp.QQ) _cfg.Alpha = percent;
+            else _cfg.WeChatAlpha = percent;
             ConfigStore.Save(_cfg);
 
             if (_active != IntPtr.Zero && Native.IsWindow(_active))
@@ -171,7 +208,7 @@ namespace QQViewerPin
 
         public void AdjustAlpha(int delta)
         {
-            SetAlpha(_cfg.Alpha + delta);
+            SetAlpha(GetAlpha() + delta);
         }
 
         public bool ToggleActiveMinimize()
@@ -190,29 +227,37 @@ namespace QQViewerPin
 
         public void ResetPositions()
         {
-            _cfg.Image = null;
-            _cfg.Video = null;
+            if (_app == PreviewApp.QQ)
+            {
+                _cfg.Image = null;
+                _cfg.Video = null;
+            }
+            else
+            {
+                _cfg.WeChatMedia = null;
+            }
             ConfigStore.Save(_cfg);
+        }
+
+        public void CollectManagedWindows(List<IntPtr> target)
+        {
+            if (!Enabled || _paused) return;
+
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Native.IsWindowVisible(h)) return true;
+
+                PreviewType type;
+                if (!LooksLikePreview(h, false, out type)) return true;
+                target.Add(h);
+                return true;
+            }, IntPtr.Zero);
         }
 
         public int CloseAllPreviews()
         {
             List<IntPtr> all = new List<IntPtr>();
-
-            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
-            {
-                if (!Native.IsWindow(h)) return true;
-                if (!Native.IsTopLevel(h)) return true;
-                if (!string.Equals(Native.ClassName(h), ChromeClass, StringComparison.Ordinal)) return true;
-                if (ClassifyTitle(Native.Title(h)) == PreviewType.None) return true;
-
-                uint pid;
-                Native.GetWindowThreadProcessId(h, out pid);
-                if (!IsQQProcess(pid)) return true;
-
-                all.Add(h);
-                return true;
-            }, IntPtr.Zero);
+            CollectManagedWindows(all);
 
             foreach (IntPtr h in all)
             {
@@ -220,15 +265,20 @@ namespace QQViewerPin
             }
             if (all.Count > 0)
             {
-                ConfigStore.Log("关闭所有预览窗：共 " + all.Count + " 个。");
+                ConfigStore.Log(AppName + "：关闭所有预览窗，共 " + all.Count + " 个。");
             }
             return all.Count;
+        }
+
+        private string AppName
+        {
+            get { return _app == PreviewApp.QQ ? "QQ" : "微信"; }
         }
 
         private void OnAlphaChanged(int percent)
         {
             EventHandler<AlphaChangedEventArgs> handler = AlphaChanged;
-            if (handler != null) handler(this, new AlphaChangedEventArgs(percent));
+            if (handler != null) handler(this, new AlphaChangedEventArgs(_app, percent));
         }
 
         private void OnWinEvent(IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild,
@@ -270,38 +320,43 @@ namespace QQViewerPin
 
         private void PreparePreview(IntPtr hwnd, string stage)
         {
-            if (_paused || hwnd == IntPtr.Zero || hwnd == _active) return;
+            if (_paused || !Enabled || hwnd == IntPtr.Zero || hwnd == _active) return;
 
-            PreviewType type = ClassifyTitle(Native.Title(hwnd));
-            if (type == PreviewType.None) return;
-            if (!LooksLikePreview(hwnd, type, false)) return;
+            PreviewType type;
+            if (!LooksLikePreview(hwnd, false, out type)) return;
 
-            // Apply the layered style while the window is still hidden/being created,
-            // so QQ cannot paint one opaque frame before the show hook runs.
+            RectData saved = GetSavedRect(type);
+            if (saved != null && saved.W > 0 && saved.H > 0)
+            {
+                // Position before the window becomes visible, so QQ/WeChat do not
+                // paint one frame in the middle of the screen first.
+                RectI target = ClampToMonitor(new RectI(saved.X, saved.Y, saved.W, saved.H));
+                Native.SetWindowPos(hwnd, IntPtr.Zero, target.X, target.Y, target.W, target.H,
+                    Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+            }
+
             if (_cfg.HideFromTaskbar)
             {
                 ApplyToolWindow(hwnd, Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE));
             }
-            ApplyAlphaInternal(hwnd, _cfg.Alpha);
-            ConfigStore.Log("预览窗" + stage + "预置透明度 hwnd=0x" + hwnd.ToInt64().ToString("X") +
-                " 类型=" + type);
+            ApplyAlphaInternal(hwnd, GetAlpha());
+            ConfigStore.Log(AppName + "：预览窗" + stage + "预置透明度 hwnd=0x" +
+                hwnd.ToInt64().ToString("X") + " 类型=" + type);
         }
 
         private void HandleShow(IntPtr hwnd)
         {
-            if (_paused) return;
+            if (_paused || !Enabled) return;
             if (hwnd == _active) return;
 
-            PreviewType type = ClassifyTitle(Native.Title(hwnd));
-            if (type == PreviewType.None)
+            PreviewType type;
+            if (!LooksLikePreview(hwnd, true, out type))
             {
                 QueueRetry(hwnd);
                 return;
             }
-            if (!LooksLikePreview(hwnd, type)) return;
 
-            // Close the gap between the show event and Adopt's alpha application.
-            ApplyAlphaInternal(hwnd, _cfg.Alpha);
+            ApplyAlphaInternal(hwnd, GetAlpha());
             Adopt(hwnd, type);
         }
 
@@ -318,7 +373,7 @@ namespace QQViewerPin
             {
                 SaveRect(_activeType, _lastRect);
             }
-            ConfigStore.Log("预览窗已关闭 hwnd=0x" + hwnd.ToInt64().ToString("X"));
+            ConfigStore.Log(AppName + "：预览窗已关闭 hwnd=0x" + hwnd.ToInt64().ToString("X"));
 
             _active = IntPtr.Zero;
             _activeType = PreviewType.None;
@@ -341,7 +396,7 @@ namespace QQViewerPin
 
         private void QueueRetry(IntPtr hwnd)
         {
-            if (_paused) return;
+            if (_paused || !Enabled) return;
             if (hwnd == IntPtr.Zero) return;
             if (_pending.Contains(hwnd)) return;
             _pending.Add(hwnd);
@@ -358,33 +413,52 @@ namespace QQViewerPin
 
             foreach (IntPtr hwnd in candidates)
             {
-                if (_paused) return;
+                if (_paused || !Enabled) return;
                 if (hwnd == _active) continue;
                 if (!Native.IsWindow(hwnd) || !Native.IsWindowVisible(hwnd)) continue;
 
-                PreviewType type = ClassifyTitle(Native.Title(hwnd));
-                if (type == PreviewType.None) continue;
-                if (!LooksLikePreview(hwnd, type)) continue;
+                PreviewType type;
+                if (!LooksLikePreview(hwnd, true, out type)) continue;
                 Adopt(hwnd, type);
             }
         }
 
-        private bool LooksLikePreview(IntPtr hwnd, PreviewType type)
+        private bool LooksLikePreview(IntPtr hwnd, bool requireVisible, out PreviewType type)
         {
-            return LooksLikePreview(hwnd, type, true);
-        }
-
-        private bool LooksLikePreview(IntPtr hwnd, PreviewType type, bool requireVisible)
-        {
+            type = PreviewType.None;
             if (!Native.IsWindow(hwnd)) return false;
             if (requireVisible && !Native.IsWindowVisible(hwnd)) return false;
             if (!Native.IsTopLevel(hwnd)) return false;
-            if (!string.Equals(Native.ClassName(hwnd), ChromeClass, StringComparison.Ordinal)) return false;
-            if (ClassifyTitle(Native.Title(hwnd)) != type) return false;
+
+            string title = Native.Title(hwnd);
+            if (title.Length == 0) return false;
 
             uint pid;
             Native.GetWindowThreadProcessId(hwnd, out pid);
-            if (!IsQQProcess(pid)) return false;
+            if (GetProcessApp(pid) != _app) return false;
+
+            if (_app == PreviewApp.QQ)
+            {
+                if (!string.Equals(Native.ClassName(hwnd), ChromeClass, StringComparison.Ordinal)) return false;
+                if (title.IndexOf("图片查看器", StringComparison.Ordinal) >= 0)
+                {
+                    type = PreviewType.Image;
+                }
+                else if (title.IndexOf("视频播放器", StringComparison.Ordinal) >= 0 ||
+                         title.IndexOf("视频查看器", StringComparison.Ordinal) >= 0)
+                {
+                    type = PreviewType.Video;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                if (!string.Equals(title, WeChatTitle, StringComparison.Ordinal)) return false;
+                type = PreviewType.Media;
+            }
 
             if (requireVisible)
             {
@@ -396,7 +470,7 @@ namespace QQViewerPin
 
         private void Adopt(IntPtr hwnd, PreviewType type)
         {
-            if (_paused) return;
+            if (_paused || !Enabled) return;
             if (hwnd == IntPtr.Zero) return;
 
             RectI cur = Native.GetRect(hwnd);
@@ -406,7 +480,7 @@ namespace QQViewerPin
 
             int ex = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
 
-            RectData saved = type == PreviewType.Image ? _cfg.Image : _cfg.Video;
+            RectData saved = GetSavedRect(type);
             RectI target;
             if (saved != null && saved.W > 0 && saved.H > 0)
             {
@@ -421,7 +495,7 @@ namespace QQViewerPin
                 Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
 
             if (_cfg.HideFromTaskbar) ApplyToolWindow(hwnd, ex);
-            ApplyAlphaInternal(hwnd, _cfg.Alpha);
+            ApplyAlphaInternal(hwnd, GetAlpha());
 
             _active = hwnd;
             _activeType = type;
@@ -431,11 +505,25 @@ namespace QQViewerPin
             _lastRect = target.Clone();
 
             SaveRect(type, target);
-            ConfigStore.Log("接管预览窗 hwnd=0x" + hwnd.ToInt64().ToString("X") + " 类型=" + type +
-                " 目标=" + target.X + "," + target.Y + " " + target.W + "x" + target.H +
-                " alpha=" + _cfg.Alpha);
+            ConfigStore.Log(AppName + "：接管预览窗 hwnd=0x" + hwnd.ToInt64().ToString("X") +
+                " 类型=" + type + " 目标=" + target.X + "," + target.Y + " " +
+                target.W + "x" + target.H + " alpha=" + GetAlpha());
             CloseOtherPreviews(hwnd);
             StartGuard();
+        }
+
+        private RectData GetSavedRect(PreviewType type)
+        {
+            if (_app == PreviewApp.QQ)
+            {
+                return type == PreviewType.Video ? _cfg.Video : _cfg.Image;
+            }
+            return _cfg.WeChatMedia;
+        }
+
+        private int GetAlpha()
+        {
+            return _app == PreviewApp.QQ ? _cfg.Alpha : _cfg.WeChatAlpha;
         }
 
         private void CaptureActiveRect()
@@ -539,23 +627,16 @@ namespace QQViewerPin
             {
                 if (h == keep) return true;
                 if (!Native.IsWindowVisible(h)) return true;
-                if (!Native.IsTopLevel(h)) return true;
-                if (!string.Equals(Native.ClassName(h), ChromeClass, StringComparison.Ordinal)) return true;
 
-                PreviewType type = ClassifyTitle(Native.Title(h));
-                if (type == PreviewType.None) return true;
-
-                uint pid;
-                Native.GetWindowThreadProcessId(h, out pid);
-                if (!IsQQProcess(pid)) return true;
-
+                PreviewType type;
+                if (!LooksLikePreview(h, false, out type)) return true;
                 others.Add(h);
                 return true;
             }, IntPtr.Zero);
 
             foreach (IntPtr h in others)
             {
-                ConfigStore.Log("关闭旧预览窗 hwnd=0x" + h.ToInt64().ToString("X"));
+                ConfigStore.Log(AppName + "：关闭旧预览窗 hwnd=0x" + h.ToInt64().ToString("X"));
                 Native.PostMessage(h, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             }
         }
@@ -569,7 +650,7 @@ namespace QQViewerPin
 
         private void GuardTimerTick(object sender, EventArgs e)
         {
-            if (_paused)
+            if (_paused || !Enabled)
             {
                 _guardTimer.Stop();
                 return;
@@ -609,10 +690,35 @@ namespace QQViewerPin
             {
                 ApplyToolWindow(_active, _originalEx);
             }
-            ApplyAlphaInternal(_active, _cfg.Alpha);
+            ApplyAlphaInternal(_active, GetAlpha());
 
             _guardTicks--;
             if (_guardTicks <= 0) _guardTimer.Stop();
+        }
+
+        private void MaintenanceTimerTick(object sender, EventArgs e)
+        {
+            if (_paused || !Enabled) return;
+            if (_active == IntPtr.Zero || !Native.IsWindow(_active) || !Native.IsWindowVisible(_active))
+            {
+                return;
+            }
+
+            int ex = Native.GetWindowLong(_active, Native.GWL_EXSTYLE);
+            if (_cfg.HideFromTaskbar && (ex & Native.WS_EX_TOOLWINDOW) == 0)
+            {
+                ApplyToolWindow(_active, _originalEx);
+            }
+
+            int desired = GetAlpha() * 255 / 100;
+            byte readAlpha;
+            uint readKey;
+            uint readFlags;
+            bool hasAlpha = Native.GetLayeredWindowAttributes(_active, out readKey, out readAlpha, out readFlags);
+            if ((ex & Native.WS_EX_LAYERED) == 0 || !hasAlpha || readAlpha != (byte)desired)
+            {
+                ApplyAlphaInternal(_active, GetAlpha());
+            }
         }
 
         private void SaveTimerTick(object sender, EventArgs e)
@@ -631,9 +737,16 @@ namespace QQViewerPin
             data.W = r.W;
             data.H = r.H;
 
-            if (type == PreviewType.Image) _cfg.Image = data;
-            else if (type == PreviewType.Video) _cfg.Video = data;
-            else return;
+            if (_app == PreviewApp.QQ)
+            {
+                if (type == PreviewType.Image) _cfg.Image = data;
+                else if (type == PreviewType.Video) _cfg.Video = data;
+                else return;
+            }
+            else
+            {
+                _cfg.WeChatMedia = data;
+            }
 
             ConfigStore.Save(_cfg);
         }
@@ -656,7 +769,7 @@ namespace QQViewerPin
 
         private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && wParam.ToInt32() == (int)Native.WM_MOUSEWHEEL && !_paused)
+            if (nCode >= 0 && wParam.ToInt32() == (int)Native.WM_MOUSEWHEEL && !_paused && Enabled)
             {
                 if (Native.IsAltDown() && IsCursorOverActive())
                 {
@@ -681,38 +794,32 @@ namespace QQViewerPin
             return Native.GetAncestor(under, Native.GA_ROOT) == _active;
         }
 
-        private bool IsQQProcess(uint pid)
+        private PreviewApp GetProcessApp(uint pid)
         {
-            bool known;
-            if (_procCache.TryGetValue(pid, out known)) return known;
+            PreviewApp cached;
+            if (_procCache.TryGetValue(pid, out cached)) return cached;
 
             IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-            if (h == IntPtr.Zero) return false;
+            if (h == IntPtr.Zero) return PreviewApp.None;
 
             try
             {
                 System.Text.StringBuilder sb = new System.Text.StringBuilder(1024);
                 uint size = (uint)sb.Capacity;
-                if (!Native.QueryFullProcessImageName(h, 0, sb, ref size)) return false;
+                if (!Native.QueryFullProcessImageName(h, 0, sb, ref size)) return PreviewApp.None;
 
                 string path = sb.ToString();
-                bool isQQ = path.EndsWith("QQ.exe", StringComparison.OrdinalIgnoreCase);
-                if (isQQ) _procCache[pid] = true;
-                return isQQ;
+                PreviewApp app = PreviewApp.None;
+                if (path.EndsWith("QQ.exe", StringComparison.OrdinalIgnoreCase)) app = PreviewApp.QQ;
+                else if (path.EndsWith("Weixin.exe", StringComparison.OrdinalIgnoreCase)) app = PreviewApp.WeChat;
+
+                if (app != PreviewApp.None) _procCache[pid] = app;
+                return app;
             }
             finally
             {
                 Native.CloseHandle(h);
             }
-        }
-
-        public static PreviewType ClassifyTitle(string title)
-        {
-            if (string.IsNullOrEmpty(title)) return PreviewType.None;
-            if (title.IndexOf("图片查看器", StringComparison.Ordinal) >= 0) return PreviewType.Image;
-            if (title.IndexOf("视频播放器", StringComparison.Ordinal) >= 0) return PreviewType.Video;
-            if (title.IndexOf("视频查看器", StringComparison.Ordinal) >= 0) return PreviewType.Video;
-            return PreviewType.None;
         }
     }
 }
